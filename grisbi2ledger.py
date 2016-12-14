@@ -298,6 +298,19 @@ class Transaction(object):
             self.reconciled = self.mother.reconciled
             self.reconciliation = self.mother.reconciliation
 
+    def effective_exchange_rate(self):
+        """Return the exchange rate.
+
+        This is a number of account currency units per transaction currency
+        units.
+        """
+        if self.currency == self.account.currency:
+            return decimal.Decimal("1.00")
+        elif not self.change_between:
+            return self.exchange_rate
+        else:
+            return decimal.Decimal("1.00") / self.exchange_rate
+
 
 class Data(object):
     """A Grisbi file.
@@ -455,6 +468,213 @@ class Data(object):
         return ok
 
 
+    def clean(self):
+        """Clean various things that need to be cleaned after the sanity checks
+        are complete.
+        """
+        # A split transaction will be represented on the Ledger side as a
+        # single transaction with many postings. On the Grisbi side, it is
+        # represented as many transactions with a mother/child relationship
+        # between them. Furthermore, each child might possibly be a transfer
+        # and therefore, on the Grisbi side, have another transaction which is
+        # its contra. All this should be packed up into a single transaction on
+        # the Ledger side, which is best represented by the mother of the
+        # split. Remove all the others.
+        to_remove = []
+        for txn in self.transactions.values():
+            if txn.is_split:
+                for child in txn.children.values():
+                    to_remove.append(child.number)
+                    contra = child.contra_transaction
+                    if contra is not None:
+                        to_remove.append(contra.number)
+        for i in to_remove:
+            del self.transactions[i]
+
+        # A transfer will be represented on the Ledger side as a single
+        # transaction with a posting in each involved account. On the Grisbi
+        # side, it is represented as two transactions which are each other’s
+        # contras. Remove one of them.
+        to_remove = set()
+        for i in sorted(self.transactions.keys()):
+            if i not in to_remove:
+                txn = self.transactions[i]
+                contra = txn.contra_transaction
+                if contra is not None:
+                    to_remove.add(contra.number)
+        for i in to_remove:
+            del self.transactions[i]
+
+
+    def _generate_reconciliation(self, fp, rec):
+        """Generate a transaction for a reconciliation.
+
+        fp -- the text file-like object to write to
+        rec -- the reconciliation object to write out
+        """
+        fp.write("{} Reconciliation\n".format(rec.date))
+        fp.write("\t; Grisbi reconciliation name: {}\n".format(rec.name))
+        for i in sorted(self.transactions.keys()):
+            outer_txn = self.transactions[i]
+            for txn in (outer_txn, outer_txn.contra_transaction):
+                if txn is not None:
+                    if txn.reconciliation is rec:
+                        fp.write("\t; Includes Grisbi transaction {}\n".format(txn.number))
+        fp.write("\t* [{}]  ={}{}\n".format(rec.account.ledger_name(), rec.account.currency.ledger_symbol, rec.balance))
+        fp.write("\n")
+
+
+    def _get_cleared_string(self, txn):
+        """Return the string for whether a transaction has cleared or not.
+
+        txn -- the transaction
+        """
+        return "* " if txn.reconciled else ""
+
+
+    def _generate_acc_posting(self, fp, txn, comment_bank_ref):
+        """Generate a posting for an account.
+
+        This is either the account part of a normal transaction (or split part)
+        or one of the parts of a transfer.
+
+        fp -- the text file-like object to write to
+        txn -- the transaction to write
+        comment_bank_ref -- whether to include the bank reference, if any, in
+            the posting’s comment
+        """
+        if comment_bank_ref and txn.bank_reference is not None:
+            comment = " ; Grisbi bank reference: {}".format(txn.bank_reference)
+        else:
+            comment = ""
+        fp.write("\t{}{}  {}{}{}\n".format(self._get_cleared_string(txn), txn.account.ledger_name(), txn.account.currency.ledger_symbol, (txn.amount * txn.effective_exchange_rate()).quantize(decimal.Decimal("0.01")), comment))
+
+
+    def _generate_cat_posting(self, fp, txn):
+        """Generate a posting for a category.
+
+        This could be the category part of a normal transaction or of a split
+        part.
+
+        fp -- the text file-like object to write to
+        txn -- the transaction to write
+        """
+        # Build account name.
+        cat = txn.category
+        target = "{}:{}".format("Expenses" if cat.is_expenses else "Income", cat.name)
+        if txn.sub_category is not None:
+            target += ":" + txn.sub_category.name
+        # Build amount, possibly with @-formatted commodity price.
+        amount = "{}{}".format(txn.currency.ledger_symbol, -txn.amount)
+        if txn.currency != txn.account.currency:
+            amount += " @ {}{}".format(txn.account.currency.ledger_symbol, txn.effective_exchange_rate())
+        # Render.
+        fp.write("\t{}{}  {}\n".format(self._get_cleared_string(txn), target, amount))
+
+
+    def generate_output(self, fp):
+        """Generate a Ledger file.
+
+        fp -- the text file-like object to write to
+        """
+        # Generate commodities.
+        for i in sorted(self.currencies.keys()):
+            curr = self.currencies[i]
+            fp.write("commodity {}\n".format(curr.ledger_symbol))
+            fp.write("\tnote {}\n".format(curr.name))
+            fp.write("\n")
+
+        # Generate accounts.
+        for i in sorted(self.accounts.keys()):
+            acc = self.accounts[i]
+            fp.write("account {}\n".format(acc.ledger_name()))
+            fp.write("\tassert commodity == \"{}\"\n".format(acc.currency.ledger_symbol))
+            if acc.account_number is not None:
+                if acc.branch_code is not None:
+                    fp.write("\tnote Account number {}-{}\n".format(acc.branch_code, acc.account_number))
+                else:
+                    fp.write("\tnote Account number {}\n".format(acc.account_number))
+            fp.write("\n")
+
+        # Generate initial balances.
+        if any(i.initial_balance != 0 for i in self.accounts.values()):
+            fp.write("account Equity:Opening Balance\n")
+            fp.write("\n")
+            first_date = min(i.date for i in self.transactions.values())
+            fp.write("{} Opening Balances\n".format(first_date))
+            for i in sorted(self.accounts.keys()):
+                acc = self.accounts[i]
+                if acc.initial_balance != 0:
+                    fp.write("\t* {}  {}{}\n".format(acc.ledger_name(), acc.currency.ledger_symbol, acc.initial_balance))
+            fp.write("\t* Equity:Opening Balance\n\n")
+
+        # Generate transactions. Interleave reconciliation records as
+        # appropriate.
+        last_reconcile = {i: None for i in self.accounts.keys()}
+        for i in sorted(self.transactions.keys()):
+            txn = self.transactions[i]
+            # If this transaction is in a different reconciliation than the
+            # last reconciliation in any account it touches, then write out
+            # reconciliations for those accounts.
+            for exact in txn.all_transactions():
+                last = last_reconcile[exact.account.number]
+                if exact.reconciliation is not last:
+                    if last is not None:
+                        self._generate_reconciliation(fp, last)
+                    last_reconcile[exact.account.number] = exact.reconciliation
+
+            # Check for bank references. If there is one, we will emit it
+            # as a CODE. If multiple, we will emit them as comments on the
+            # postings.
+            bank_refs = set()
+            for txns in ({txn.number: txn}, txn.children):
+                for j in sorted(txns.keys()):
+                    child_txn = txns[j]
+                    if child_txn.bank_reference is not None:
+                        bank_refs.add(child_txn.bank_reference)
+                    if child_txn.contra_transaction is not None and child_txn.contra_transaction.bank_reference is not None:
+                        bank_refs.add(child_txn.contra_transaction.bank_reference)
+            comment_bank_ref = len(bank_refs) > 1
+            code_bank_ref = "({}) ".format(list(bank_refs)[0]) if len(bank_refs) == 1 else ""
+
+            # Write out basic top matter.
+            fp.write("{} {}{}\n".format(txn.date, code_bank_ref, txn.party.name))
+            fp.write("\t; Imported from Grisbi transaction {}.\n".format(txn.number))
+            if txn.notes is not None:
+                fp.write("\t; Grisbi notes: {}\n".format(txn.notes))
+
+            if txn.is_split:
+                # Split transaction. The parent and each child become a
+                # posting.
+                fp.write("\t; Grisbi transaction was a split totalling {}{}.\n".format(txn.currency.ledger_symbol, txn.amount))
+                self._generate_acc_posting(fp, txn, comment_bank_ref)
+                for j in sorted(txn.children.keys()):
+                    child = txn.children[j]
+                    if child.contra_transaction is None:
+                        self._generate_cat_posting(fp, child)
+                    else:
+                        self._generate_acc_posting(fp, child.contra_transaction, comment_bank_ref)
+                        fp.write("\t; Grisbi transaction {} was the contra and was not imported separately.\n".format(child.contra_transaction.number))
+                fp.write("\n")
+            else:
+                # Non-split transaction.
+                self._generate_acc_posting(fp, txn, comment_bank_ref)
+                if txn.contra_transaction is not None:
+                    # Transfer. Second posting is the other account.
+                    self._generate_acc_posting(fp, txn.contra_transaction, comment_bank_ref)
+                    fp.write("\t; Grisbi transaction {} was the contra and was not imported separately.\n".format(txn.contra_transaction.number))
+                    fp.write("\n")
+                else:
+                    # Normal transaction. Second posting is the category.
+                    self._generate_cat_posting(fp, txn)
+                    fp.write("\n")
+
+        # Generate the final reconciliations.
+        for i in last_reconcile:
+            rec = last_reconcile[i]
+            if rec is not None:
+                self._generate_reconciliation(fp, rec)
+
 def main():
     """Application entry point."""
     # Parse parameters.
@@ -470,6 +690,13 @@ def main():
     # Sanity check.
     if not data.check():
         sys.exit(1)
+
+    # Post-check cleanup.
+    data.clean()
+
+    # Generate output.
+    with open(args.output, "w") as fp:
+        data.generate_output(fp)
 
 
 if __name__ == "__main__":
