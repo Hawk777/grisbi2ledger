@@ -53,6 +53,10 @@ class Account(object):
         if self.account_number == "(null)":
             self.account_number = None
 
+    def resolve_references(self, data):
+        """Resolve the reference to the account’s currency."""
+        self.currency = data.currencies[self.currency]
+
 
 class Category(object):
     """A transaction payee category.
@@ -60,6 +64,7 @@ class Category(object):
     number -- the Grisbi-internal ID number of the category
     name -- the name of the category
     is_expenses -- whether this category is used for expenses (versus income)
+    sub_categories -- the subcategories in this category
     """
     def __init__(self, catElt):
         """Construct a Category.
@@ -72,6 +77,11 @@ class Category(object):
         kd = int(catElt.get("Kd"))
         assert kd in (0, 1)
         self.is_expenses = bool(kd)
+        self.sub_categories = {}
+
+    def resolve_references(self, data):
+        """Do nothing."""
+        pass
 
 
 class SubCategory(object):
@@ -91,6 +101,11 @@ class SubCategory(object):
         self.number = int(subCatElt.get("Nb"))
         self.category = int(subCatElt.get("Nbc"))
         self.name = subCatElt.get("Na")
+
+    def resolve_references(self, data):
+        """Resolve the reference to the Category and add self to it."""
+        self.category = data.categories[self.category]
+        self.category.sub_categories[self.number] = self
 
 
 class Currency(object):
@@ -115,6 +130,10 @@ class Currency(object):
         self.abbreviation = curElt.get("Ico")
         assert curElt.get("Fl") == "2", "Only two-decimal-place currencies are supported."
 
+    def resolve_references(self, data):
+        """Do nothing."""
+        pass
+
 
 class Party(object):
     """A counterparty to transactions.
@@ -130,6 +149,10 @@ class Party(object):
         assert partyElt.tag == "Party"
         self.number = int(partyElt.get("Nb"))
         self.name = partyElt.get("Na")
+
+    def resolve_references(self, data):
+        """Do nothing."""
+        pass
 
 
 class Reconcile(object):
@@ -152,6 +175,10 @@ class Reconcile(object):
         self.account = int(recElt.get("Acc"))
         self.date = _parse_date(recElt.get("Fdate"))
         self.balance = decimal.Decimal(recElt.get("Fbal"))
+
+    def resolve_references(self, data):
+        """Resolve the reference to the account."""
+        self.account = data.accounts[self.account]
 
 
 class Transaction(object):
@@ -189,6 +216,7 @@ class Transaction(object):
         is not part of an inter-account transfer
     mother -- the split transaction that this transaction is part of, or None
         if this is a top-level transaction
+    children -- the children of this transaction, if it is a split transaction
     """
     def __init__(self, txnElt):
         """Construct a Transaction.
@@ -227,6 +255,35 @@ class Transaction(object):
             self.bank_reference = None
         self.contra_transaction = int(txnElt.get("Trt")) or None
         self.mother = int(txnElt.get("Mo")) or None
+        self.children = {}
+
+    def resolve_references(self, data):
+        """Resolve references to various other objects."""
+        self.account = data.accounts[self.account]
+        self.currency = data.currencies[self.currency]
+        if self.party is not None:
+            self.party = data.parties[self.party]
+        if self.category is not None:
+            self.category = data.categories[self.category]
+        if self.sub_category is not None:
+            self.sub_category = self.category.sub_categories[self.sub_category]
+        if self.reconciliation is not None:
+            self.reconciliation = data.reconciles[self.reconciliation]
+        if self.contra_transaction is not None:
+            self.contra_transaction = data.transactions[self.contra_transaction]
+        if self.mother is not None:
+            self.mother = data.transactions[self.mother]
+            self.mother.children[self.number] = self
+            if self.date is None:
+                self.date = self.mother.date
+            # Grisbi sometimes records children of splits as reconciled and
+            # sometimes doesn’t. There is no clear logic as to why it picks
+            # either status. The UI never shows a marking on children, and does
+            # not allow selecting children independently for reconciliation.
+            # The data seems useless. Instead, just inherit the reconiliation
+            # situation from the mother.
+            self.reconciled = self.mother.reconciled
+            self.reconciliation = self.mother.reconciliation
 
 
 class Data(object):
@@ -284,6 +341,11 @@ class Data(object):
                     txn = Transaction(child)
                     assert txn.number not in self.transactions
                     self.transactions[txn.number] = txn
+
+        # Resolve inter-object references from IDs to objects.
+        for i in self.accounts, self.categories, subCategories, self.currencies, self.parties, self.reconciles, self.transactions:
+            for j in i:
+                i[j].resolve_references(self)
 
 
 def main():
