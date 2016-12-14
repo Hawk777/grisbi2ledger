@@ -58,6 +58,10 @@ class Account(object):
         """Resolve the reference to the account’s currency."""
         self.currency = data.currencies[self.currency]
 
+    def ledger_name(self):
+        """Return the name of the account in Ledger."""
+        return "{}:{}".format("Liabilities" if self.kind == ACCOUNT_KIND_LIABILITY else "Assets", self.name)
+
 
 class Category(object):
     """A transaction payee category.
@@ -116,6 +120,7 @@ class Currency(object):
     name -- the long human-readable name of the currency (e.g. Canadian Dollar)
     symbol -- the very short symbolic identifier of the currency (e.g. $)
     abbreviation -- the short abbreviation of the currency (e.g. CAD)
+    ledger_symbol -- symbol or abbreviation, whichever is appropriate
     """
     def __init__(self, curElt):
         """Construct a Currency.
@@ -132,8 +137,15 @@ class Currency(object):
         assert curElt.get("Fl") == "2", "Only two-decimal-place currencies are supported."
 
     def resolve_references(self, data):
-        """Do nothing."""
-        pass
+        """Decide what symbol to use for this currency."""
+        if (self.symbol is None) or any(i.number < self.number and i.symbol == self.symbol for i in data.currencies.values()):
+            # Some other currency uses the same symbol and appears before us,
+            # or we have no symbol; use the abbreviation.
+            self.ledger_symbol = self.abbreviation
+        else:
+            # No other currency uses the same symbol, or we are the first to
+            # use it; use the symbol.
+            self.ledger_symbol = self.symbol
 
 
 class Party(object):
