@@ -3,6 +3,7 @@
 import argparse
 import datetime
 import decimal
+import sys
 import xml.etree.ElementTree as ET
 
 
@@ -348,6 +349,100 @@ class Data(object):
                 i[j].resolve_references(self)
 
 
+    def check(self):
+        """Perform some basic sanity checks."""
+        ok = True
+        # We do not support transactions without a party, other than the parent
+        # part of a split.
+        for i in sorted(self.transactions.keys()):
+            txn = self.transactions[i]
+            if txn.party is None and not txn.is_split:
+                print("Transaction {} in account {} on date {} has no party and is not a split.".format(txn.number, txn.account.name, txn.date))
+                ok = False
+
+        # We cannot have a split transaction with no children, or a non-split
+        # transaction with children.
+        for i in sorted(self.transactions.keys()):
+            txn = self.transactions[i]
+            if txn.is_split and not txn.children:
+                print("Transaction {} in account {} on date {} is a split but has no children.".format(txn.number, txn.account.name, txn.date))
+                ok = False
+            elif not txn.is_split and txn.children:
+                print("Transaction {} in account {} on date {} is not a split but has children.".format(txn.number, txn.account.name, txn.date))
+                ok = False
+
+        # The contra relationship between transactions must be symmetric.
+        for i in sorted(self.transactions.keys()):
+            txn = self.transactions[i]
+            if txn.contra_transaction is not None:
+                if txn.contra_transaction.contra_transaction is not txn:
+                    print("Transaction {} in account {} on date {} has contra transaction {} in account {} on date {} but the latter transaction’s contra is {}, not {} as expected.".format(txn.number, txn.account.name, txn.date, txn.contra_transaction.number, txn.contra_transaction.account.name, txn.contra_transaction.date, txn.contra_transaction.contra_transaction.number, txn.number))
+                    ok = False
+
+        # We do not support transactions without a category or contra that are
+        # not splits (a contra and a split both show up as if they were a
+        # category in the Grisbi UI, but are not stored as such in the data
+        # file).
+        for i in sorted(self.transactions.keys()):
+            txn = self.transactions[i]
+            if txn.category is None and txn.contra_transaction is None and not txn.is_split:
+                print("Transaction {} in account {} on date {} has no category or contra and is not a split.".format(txn.number, txn.account.name, txn.date))
+                ok = False
+
+        # A category or subcategory cannot contain two spaces or a tab in its
+        # name.
+        for i in sorted(self.categories.keys()):
+            cat = self.categories[i]
+            if "  " in cat.name or "\t" in cat.name:
+                print("Category {} has two spaces or a tab in its name.".format(cat.name))
+                ok = False
+            for j in sorted(cat.sub_categories.keys()):
+                sub_cat = cat.sub_categories[j]
+                if "  " in sub_cat.name or "\t" in sub_cat.name:
+                    print("Subcategory {}:{} has two spaces or a tab in its name.".format(cat.name, sub_cat.name))
+                    ok = False
+
+        # A transaction and its contra cannot both be part of splits.
+        for i in sorted(self.transactions.keys()):
+            txn = self.transactions[i]
+            contra = txn.contra_transaction
+            if contra is not None:
+                if txn.mother is not None and contra.mother is not None:
+                    print("Transaction {} in account {} on date {} has contra {} in account {} on date {} and both are part of splits.".format(txn.number, txn.account.name, txn.date, contra.number, contra.account.name, contra.date))
+                    ok = False
+
+        # Two reconciliations on the same account must not have the same date.
+        seen = {}
+        for rec in self.reconciles.values():
+            if rec.account.number not in seen:
+                seen[rec.account.number] = {}
+            acc = seen[rec.account.number]
+            if rec.date in acc:
+                print("Reconciliation {} in account {} on date {} happened on the same day as reconciliation {}.".format(rec.name, rec.account.name, rec.date, acc[rec.date].name))
+                ok = False
+            acc[rec.date] = rec
+
+        # A transaction must be reconciled if and only if it has a
+        # reconciliation. Note that having a reconciliation but not being
+        # marked reconciled is impossible due to how we load data.
+        for i in sorted(self.transactions.keys()):
+            txn = self.transactions[i]
+            if txn.reconciled and txn.reconciliation is None:
+                print("Transaction {} in account {} on date {} is reconciled but has no reconciliation.".format(i, txn.account.name, txn.date))
+                ok = False
+
+        # A transaction’s reconciliation must be for its own account.
+        for i in sorted(self.transactions.keys()):
+            outer_txn = self.transactions[i]
+            for txn in outer_txn.all_transactions():
+                if txn.reconciled and txn.reconciliation is not None:
+                    if txn.reconciliation.account is not txn.account:
+                        print("Transaction {} in account {} on date {} is reconciled by reconciliation {} on account {}.".format(txn.number, txn.account.name, txn.date, txn.reconciliation.name, txn.reconciliation.account.name))
+                        ok = False
+
+        return ok
+
+
 def main():
     """Application entry point."""
     # Parse parameters.
@@ -359,6 +454,10 @@ def main():
     # Parse input file.
     grisbiElt = ET.parse(args.input).getroot()
     data = Data(grisbiElt)
+
+    # Sanity check.
+    if not data.check():
+        sys.exit(1)
 
 
 if __name__ == "__main__":
