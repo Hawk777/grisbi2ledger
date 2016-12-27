@@ -3,6 +3,7 @@
 import argparse
 import datetime
 import decimal
+import heapq
 import sys
 import xml.etree.ElementTree as ET
 
@@ -20,6 +21,40 @@ ACCOUNT_KIND_BANK = 0
 ACCOUNT_KIND_CASH = 1
 ACCOUNT_KIND_LIABILITY = 2
 ACCOUNT_KIND_ASSET = 3
+
+
+def find_cycle(adj):
+    """Finds a cycle in an adjacency list.
+
+    adj -- a dict mapping from node name to set of nodes reachable by edges out
+        from that node
+    """
+    # This is a simple depth-first search starting from each node in turn until
+    # a cycle is found.
+    parent = {}
+    def _find_cycle_impl(node):
+        for child in adj[node]:
+            if child in parent:
+                return child
+        for child in adj[node]:
+            parent[child] = node
+            term = _find_cycle_impl(child)
+            if term is not None:
+                return term
+            del parent[child]
+        return None
+    for start in adj.keys():
+        parent[start] = None
+        term = _find_cycle_impl(start)
+        if term:
+            cycle = []
+            while term is not None:
+                cycle.append(term)
+                term = parent[term]
+            cycle.reverse()
+            return cycle
+        del parent[start]
+    return None
 
 
 class Account(object):
@@ -311,6 +346,50 @@ class Transaction(object):
         else:
             return decimal.Decimal("1.00") / self.exchange_rate
 
+    def all_transactions(self):
+        """Return a list of all transactions in this one.
+
+        This is the current transaction, the contra if any, and children and
+        their contras if any.
+        """
+        ret = [self]
+        if self.contra_transaction is not None:
+            ret.append(self.contra_transaction)
+        for child in self.children.values():
+            ret.append(child)
+            if child.contra_transaction is not None:
+                ret.append(child.contra_transaction)
+        return ret
+
+    def happens_before_local(self, other):
+        """Checks whether this transaction happens before another.
+
+        This ignores child transactions and only deals with this exact
+        transaction and the exact other transaction.
+
+        other -- the other transaction to check against
+        """
+        if self.account is not other.account:
+            return False
+        if not self.reconciled:
+            return False
+        if self.reconciled and not other.reconciled:
+            return True
+        return self.reconciliation.date < other.reconciliation.date
+
+    def happens_before(self, other):
+        """Checks whether reconciliations imply an ordering.
+
+        other -- the other transaction to check against
+        """
+        self_all = self.all_transactions()
+        other_all = other.all_transactions()
+        for x in self_all:
+            for y in other_all:
+                if x.happens_before_local(y):
+                    return True
+        return False
+
 
 class Data(object):
     """A Grisbi file.
@@ -524,6 +603,71 @@ class Data(object):
         fp.write("\n")
 
 
+    def _get_sorted_transactions(self):
+        """Generate a list of Transaction objects in proper order.
+
+        The proper order is the order such that transactions happen before the
+        reconciliation that contains them, but after any reconciliations prior
+        to that one. Between transactions that are not otherwise ordered by
+        reconciliations, ordering is first by date and then by transaction
+        number.
+        """
+        # This is Kahn’s algorithm. A happens-before edge runs from node X to
+        # node Y if X and Y are tranasctions which touch the same account, and
+        # either X is in an earlier reconciliation than Y or X is reconciled
+        # and Y is not.
+        #
+        # Store the edges in a pair of adjacency data structures, one forward
+        # and one reverse. An edge from X to Y is represented by adjf[X]
+        # containing Y and adjr[Y] containing X.
+        #
+        # Use a heap to store the set of all nodes with no incoming edges. The
+        # heap is over a list of tuples of the form (txn_date, txn_number)
+        # which therefore sorts in the desired order.
+        adjf = {}
+        adjr = {}
+        visitable = []
+        for x in self.transactions.values():
+            for y in self.transactions.values():
+                if x.happens_before(y):
+                    adjf.setdefault(x.number, set()).add(y.number)
+                    adjr.setdefault(y.number, set()).add(x.number)
+        for x in self.transactions.values():
+            if x.number not in adjr:
+                visitable.append((x.date, x.number))
+        heapq.heapify(visitable)
+        ret = []
+        while visitable:
+            txn = self.transactions[heapq.heappop(visitable)[1]]
+            ret.append(txn)
+            for other in adjf.pop(txn.number, ()):
+                other = self.transactions[other]
+                adjrelt = adjr[other.number]
+                assert txn.number in adjrelt
+                adjrelt.remove(txn.number)
+                if not adjrelt:
+                    del adjr[other.number]
+                    heapq.heappush(visitable, (other.date, other.number))
+        if adjf:
+            cycle = find_cycle(adjf)
+            print("Cycle detected in transaction ordering:")
+            for i in range(len(cycle)):
+                before = self.transactions[cycle[i]]
+                after = self.transactions[cycle[i % len(cycle)]]
+                print("Transaction {} in account {} on date {} happens before transaction {} in account {} on date {} because:".format(before.number, before.account.name, before.date, after.number, after.account.name, after.date))
+                for x in before.all_transactions():
+                    for y in after.all_transactions():
+                        if x.happens_before_local(y):
+                            print("  Exact transaction {} in account {} on date {} happens before transaction {} in account {} on date {}.".format(x.number, x.account.name, x.date, y.number, y.account.name, y.date))
+                            break
+            sys.exit(1)
+        assert not adjr
+        returning_numbers = set(x.number for x in ret)
+        orig_numbers = set(self.transactions.keys())
+        assert returning_numbers == orig_numbers
+        return ret
+
+
     def _get_cleared_string(self, txn):
         """Return the string for whether a transaction has cleared or not.
 
@@ -611,8 +755,7 @@ class Data(object):
         # Generate transactions. Interleave reconciliation records as
         # appropriate.
         last_reconcile = {i: None for i in self.accounts.keys()}
-        for i in sorted(self.transactions.keys()):
-            txn = self.transactions[i]
+        for txn in self._get_sorted_transactions():
             # If this transaction is in a different reconciliation than the
             # last reconciliation in any account it touches, then write out
             # reconciliations for those accounts.
