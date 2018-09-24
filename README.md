@@ -91,3 +91,10 @@ Fix it and submit a pull request, please. I don’t use Grisbi2Ledger (I used it
 exactly once, immediately after writing it); therefore I don’t actively
 maintain it. I’ll accept pull requests that fix bugs, though, so other people
 can benefit.
+
+
+
+# License #
+
+Grisbi2Ledger is © Christopher Head and is released under the GNU General
+Public License version 3.
