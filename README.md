@@ -51,7 +51,7 @@ preceding two paragraphs.
 
 In all cases, the payee name of a transaction is copied from Grisbi to Ledger.
 Any Grisbi notes are copied into Ledger comments. If a bank reference is
-present one exactly one Grisbi transaction, it is copied into the Ledger
+present on exactly one Grisbi transaction, it is copied into the Ledger
 transaction’s CODE field; otherwise, the bank references are copied into
 comments. Comments indicating the Grisbi transaction numbers involved are
 written out in the Ledger transaction.
